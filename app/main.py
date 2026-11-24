@@ -9,8 +9,8 @@ from pathlib import Path
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Integer, String, ForeignKey, select, or_
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import create_engine, Integer, String, ForeignKey, select, or_, JSON, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./school.db")
@@ -49,9 +49,24 @@ class Teacher(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
     full_name: Mapped[str] = mapped_column(String(120))
     subject: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    classes: Mapped[list] = mapped_column(JSON, default=list)
     user: Mapped[User] = relationship(back_populates="teacher")
 
 Base.metadata.create_all(engine)
+with engine.begin() as connection:
+    columns = connection.execute(
+        text("PRAGMA table_info(teachers)")
+    ).fetchall()
+
+    column_names = [column[1] for column in columns]
+
+    if "classes" not in column_names:
+        connection.execute(
+            text("""
+                ALTER TABLE teachers
+                ADD COLUMN classes JSON NOT NULL DEFAULT '[]'
+            """)
+        )
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 app = FastAPI(title="School Management Backend", version="1.0.0")
@@ -75,17 +90,43 @@ class StudentUpdate(BaseModel):
     section: Optional[str] = Field(default=None, max_length=10)
     password: Optional[str] = Field(default=None, min_length=8)
 
+def validate_teacher_classes(classes):
+    if len(classes) != len(set(classes)):
+        raise ValueError("Duplicate classes are not allowed")
+
+    if any(class_number < 1 or class_number > 10 for class_number in classes):
+        raise ValueError("Classes must be between 1 and 10")
+
+    return classes
 class TeacherCreate(BaseModel):
     login_id: str = Field(min_length=3, max_length=60)
     password: str = Field(min_length=8)
     full_name: str = Field(min_length=1, max_length=120)
     subject: Optional[str] = Field(default=None, max_length=80)
-
+    classes: list[int] = Field(default_factory=list, max_length=10)
+    @field_validator("classes")
+    @classmethod
+    def check_classes(cls, value):
+        return validate_teacher_classes(value)
 class TeacherUpdate(BaseModel):
     full_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
     subject: Optional[str] = Field(default=None, max_length=80)
     password: Optional[str] = Field(default=None, min_length=8)
+    classes: Optional[list[int]] = Field(default=None, max_length=10)
+    @field_validator("classes")
+    @classmethod
+    def check_classes(cls, value):
+        if value is not None:
+            return validate_teacher_classes(value)
+        return value
+def validate_teacher_classes(classes):
+    if len(classes) != len(set(classes)):
+        raise ValueError("Duplicate classes are not allowed")
 
+    if any(class_number < 1 or class_number > 10 for class_number in classes):
+        raise ValueError("Classes must be between 1 and 10")
+
+    return classes
 def get_db():
     db = SessionLocal()
     try:
@@ -151,7 +192,12 @@ def home():
 @app.get("/admin")
 def admin_dashboard():
     return FileResponse(FRONTEND_DIR / "admin.html")
-
+@app.get("/student")
+def student_dashboard():
+    return FileResponse(FRONTEND_DIR / "student.html")
+@app.get("/teacher")
+def teacher_dashboard():
+    return FileResponse(FRONTEND_DIR / "teacher.html")
 @app.get("/api/health")
 def health():
     return {"message": "School backend is running"}
@@ -170,7 +216,7 @@ def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
         result.update({"name": user.student.full_name, "class": user.student.class_number,
                        "section": user.student.section})
     if user.role == "teacher" and user.teacher:
-        result.update({"name": user.teacher.full_name, "subject": user.teacher.subject})
+        result.update({"name": user.teacher.full_name, "subject": user.teacher.subject, "classes": user.teacher.classes or []})
     return result
 
 # Student and teacher accounts are created/managed by an admin.
@@ -236,7 +282,7 @@ def add_teacher(data: TeacherCreate, db: Session = Depends(get_db),
     user = User(login_id=data.login_id, password_hash=hash_password(data.password), role="teacher")
     db.add(user)
     db.flush()
-    teacher = Teacher(user_id=user.id, full_name=data.full_name, subject=data.subject)
+    teacher = Teacher(user_id=user.id, full_name=data.full_name, subject=data.subject,  classes=data.classes)
     db.add(teacher)
     db.commit()
     db.refresh(teacher)
@@ -285,4 +331,4 @@ def student_view(s: Student):
 
 def teacher_view(t: Teacher):
     return {"id": t.id, "login_id": t.user.login_id, "full_name": t.full_name,
-            "subject": t.subject}
+            "subject": t.subject,  "classes": t.classes or []}

@@ -44,7 +44,12 @@ loginForm.addEventListener("submit", async function(event) {
 	if (data.role === "admin") {
    		 window.location.href = "/admin";
 	}
-
+	else if (data.role === "student") {
+   	window.location.href = "/student";
+	}
+	else if (data.role === "teacher") {
+    	window.location.href = "/teacher";
+	}
     } catch (error) {
 
         message.style.color = "red";
@@ -282,8 +287,9 @@ function displayTeachers(teachers) {
         const details = document.createElement("p");
 
         details.textContent =
-            `${teacher.full_name} | Subject: ${teacher.subject || "-"} | ` +
-            `Login ID: ${teacher.login_id} | ID: ${teacher.id}`;
+        `${teacher.full_name} | Subject: ${teacher.subject || "-"} | ` +
+        `Classes: ${(teacher.classes || []).join(", ") || "-"} | ` +
+        `Login ID: ${teacher.login_id} | ID: ${teacher.id}`;
 
         const editButton = document.createElement("button");
         editButton.textContent = "Edit";
@@ -297,15 +303,27 @@ function displayTeachers(teachers) {
         list.appendChild(card);
     });
 }
-
+async function loadTeachers() {
+    try {
+        const teachers = await apiRequest("/admin/teachers");
+        displayTeachers(teachers);
+    } catch (error) {
+        alert(error.message);
+    }
+}
 async function addTeacher(event) {
     event.preventDefault();
+
+    const selectedClasses = Array.from(
+        document.querySelectorAll('input[name="teacherClass"]:checked')
+    ).map(input => Number(input.value));
 
     const teacher = {
         login_id: document.getElementById("teacherLogin").value,
         password: document.getElementById("teacherPassword").value,
         full_name: document.getElementById("teacherName").value,
-        subject: document.getElementById("teacherSubject").value || null
+        subject: document.getElementById("teacherSubject").value || null,
+        classes: selectedClasses
     };
 
     try {
@@ -327,16 +345,6 @@ async function addTeacher(event) {
         alert(error.message);
     }
 }
-
-async function loadTeachers() {
-    try {
-        const teachers = await apiRequest("/admin/teachers");
-        displayTeachers(teachers);
-    } catch (error) {
-        alert(error.message);
-    }
-}
-
 async function searchTeachers() {
     const query = document.getElementById("searchTeacher").value;
 
@@ -360,8 +368,29 @@ async function editTeacher(teacher) {
 
     if (subject === null) return;
 
+    const currentClasses = (teacher.classes || []).join(",");
+
+    const classesInput = prompt(
+        "Enter classes separated by commas (example: 6,7,8):",
+        currentClasses
+    );
+
+    if (classesInput === null) return;
+
     if (!name.trim()) {
         alert("Teacher name cannot be empty.");
+        return;
+    }
+
+    const classes = classesInput.trim() === ""
+        ? []
+        : classesInput.split(",").map(value => Number(value.trim()));
+
+    if (
+        classes.some(value => !Number.isInteger(value) || value < 1 || value > 10) ||
+        new Set(classes).size !== classes.length
+    ) {
+        alert("Enter unique class numbers between 1 and 10.");
         return;
     }
 
@@ -373,7 +402,8 @@ async function editTeacher(teacher) {
             },
             body: JSON.stringify({
                 full_name: name.trim(),
-                subject: subject.trim() || null
+                subject: subject.trim() || null,
+                classes: classes
             })
         });
 
@@ -385,6 +415,7 @@ async function editTeacher(teacher) {
         alert(error.message);
     }
 }
+       
 function showTeachers() {
     const content = document.getElementById("dashboard-content");
 
@@ -406,7 +437,16 @@ function showTeachers() {
             <input id="teacherName" placeholder="Full Name" required>
 
             <input id="teacherSubject" placeholder="Subject">
+            <h3>Select Classes Teaching</h3>
 
+		<div id="teacherClasses">
+   		 ${Array.from({length: 10}, (_, i) => `
+       		 <label style="display: inline-block; margin: 8px;">
+           	 <input type="checkbox" name="teacherClass" value="${i + 1}">
+            	Class ${i + 1}
+        	</label>
+   		 `).join("")}
+		</div>
             <button type="submit">Add Teacher</button>
         </form>
 
@@ -444,4 +484,90 @@ async function deleteTeacher(id) {
     } catch (error) {
         alert(error.message);
     }
+}
+
+async function loadStudentProfile() {
+    const details = document.getElementById("studentDetails");
+    const welcome = document.getElementById("welcomeMessage");
+
+    if (!getToken()) {
+        window.location.href = "/";
+        return;
+    }
+
+    try {
+        const student = await apiRequest("/auth/me");
+
+        if (student.role !== "student") {
+            window.location.href = "/";
+            return;
+        }
+
+        welcome.textContent = "Welcome, " + student.name;
+
+        details.innerHTML = "";
+
+        const fields = [
+            ["Full Name", student.name],
+            ["Login ID", student.login_id],
+            ["Class", student.class],
+            ["Section", student.section || "-"]
+        ];
+
+        fields.forEach(([label, value]) => {
+            const paragraph = document.createElement("p");
+            paragraph.textContent = label + ": " + value;
+            details.appendChild(paragraph);
+        });
+
+    } catch (error) {
+        alert(error.message);
+        logout();
+    }
+}
+
+if (document.getElementById("studentDetails")) {
+    loadStudentProfile();
+}
+async function loadTeacherProfile() {
+    const details = document.getElementById("teacherDetails");
+    const welcome = document.getElementById("welcomeMessage");
+
+    if (!getToken()) {
+        window.location.href = "/";
+        return;
+    }
+
+    try {
+        const teacher = await apiRequest("/auth/me");
+
+        if (teacher.role !== "teacher") {
+            window.location.href = "/";
+            return;
+        }
+
+        welcome.textContent = "Welcome, " + teacher.name;
+
+        details.innerHTML = "";
+
+        const fields = [
+            ["Full Name", teacher.name],
+            ["Login ID", teacher.login_id],
+            ["Subject", teacher.subject || "-"],
+	    ["Classes Teaching", (teacher.classes || []).join(", ") || "Not assigned"]
+        ];
+
+        fields.forEach(([label, value]) => {
+            const paragraph = document.createElement("p");
+            paragraph.textContent = label + ": " + value;
+            details.appendChild(paragraph);
+        });
+
+    } catch (error) {
+        details.textContent = "Error loading teacher details: " + error.message;
+    }
+}
+
+if (document.getElementById("teacherDetails")) {
+    loadTeacherProfile();
 }
