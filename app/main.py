@@ -1,0 +1,288 @@
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pathlib import Path
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, Integer, String, ForeignKey, select, or_
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./school.db")
+SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE-THIS-SECRET-BEFORE-DEPLOYING")
+ALGORITHM = "HS256"
+TOKEN_MINUTES = int(os.getenv("TOKEN_MINUTES", "60"))
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    login_id: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), index=True)  # student, teacher, admin
+    student: Mapped[Optional["Student"]] = relationship(back_populates="user", uselist=False)
+    teacher: Mapped[Optional["Teacher"]] = relationship(back_populates="user", uselist=False)
+
+class Student(Base):
+    __tablename__ = "students"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    full_name: Mapped[str] = mapped_column(String(120))
+    class_number: Mapped[int] = mapped_column(Integer, index=True)
+    section: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    user: Mapped[User] = relationship(back_populates="student")
+
+class Teacher(Base):
+    __tablename__ = "teachers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    full_name: Mapped[str] = mapped_column(String(120))
+    subject: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    user: Mapped[User] = relationship(back_populates="teacher")
+
+Base.metadata.create_all(engine)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+app = FastAPI(title="School Management Backend", version="1.0.0")
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+app.mount(
+    "/static",
+    StaticFiles(directory=FRONTEND_DIR),
+    name="static"
+)
+class StudentCreate(BaseModel):
+    login_id: str = Field(min_length=3, max_length=60)
+    password: str = Field(min_length=8)
+    full_name: str = Field(min_length=1, max_length=120)
+    class_number: int = Field(ge=1, le=10)
+    section: Optional[str] = Field(default=None, max_length=10)
+
+class StudentUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    class_number: Optional[int] = Field(default=None, ge=1, le=10)
+    section: Optional[str] = Field(default=None, max_length=10)
+    password: Optional[str] = Field(default=None, min_length=8)
+
+class TeacherCreate(BaseModel):
+    login_id: str = Field(min_length=3, max_length=60)
+    password: str = Field(min_length=8)
+    full_name: str = Field(min_length=1, max_length=120)
+    subject: Optional[str] = Field(default=None, max_length=80)
+
+class TeacherUpdate(BaseModel):
+    full_name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    subject: Optional[str] = Field(default=None, max_length=80)
+    password: Optional[str] = Field(default=None, min_length=8)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def authenticate(db: Session, login_id: str, password: str):
+    user = db.scalar(select(User).where(User.login_id == login_id))
+    if not user or not pwd_context.verify(password, user.password_hash):
+        return None
+    return user
+
+def make_token(user: User):
+    expires = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_MINUTES)
+    return jwt.encode(
+        {"sub": str(user.id), "role": user.role, "exp": expires},
+        SECRET_KEY, algorithm=ALGORITHM
+    )
+
+def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                          detail="Invalid or expired login token",
+                          headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        raise error
+    user = db.get(User, user_id)
+    if not user:
+        raise error
+    return user
+
+def require_role(*roles):
+    def checker(user: User = Depends(current_user)):
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="You do not have permission")
+        return user
+    return checker
+
+def ensure_unique_login(db: Session, login_id: str):
+    if db.scalar(select(User).where(User.login_id == login_id)):
+        raise HTTPException(status_code=409, detail="Login ID already exists")
+
+@app.on_event("startup")
+def create_initial_admin():
+    """Creates the first admin from environment variables if one does not exist."""
+    admin_id = os.getenv("ADMIN_ID")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if not admin_id or not admin_password:
+        return
+    with SessionLocal() as db:
+        if not db.scalar(select(User).where(User.role == "admin")):
+            db.add(User(login_id=admin_id, password_hash=hash_password(admin_password), role="admin"))
+            db.commit()
+@app.get("/")
+def home():
+    return FileResponse(FRONTEND_DIR / "index.html")
+@app.get("/admin")
+def admin_dashboard():
+    return FileResponse(FRONTEND_DIR / "admin.html")
+
+@app.get("/api/health")
+def health():
+    return {"message": "School backend is running"}
+@app.post("/auth/login")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """Use username field for the user's ID and password for all three roles."""
+    user = authenticate(db, form.username, form.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect ID or password")
+    return {"access_token": make_token(user), "token_type": "bearer", "role": user.role}
+
+@app.get("/auth/me")
+def me(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    result = {"login_id": user.login_id, "role": user.role}
+    if user.role == "student" and user.student:
+        result.update({"name": user.student.full_name, "class": user.student.class_number,
+                       "section": user.student.section})
+    if user.role == "teacher" and user.teacher:
+        result.update({"name": user.teacher.full_name, "subject": user.teacher.subject})
+    return result
+
+# Student and teacher accounts are created/managed by an admin.
+@app.post("/admin/students", status_code=201)
+def add_student(data: StudentCreate, db: Session = Depends(get_db),
+                admin: User = Depends(require_role("admin"))):
+    ensure_unique_login(db, data.login_id)
+    user = User(login_id=data.login_id, password_hash=hash_password(data.password), role="student")
+    db.add(user)
+    db.flush()
+    student = Student(user_id=user.id, full_name=data.full_name,
+                      class_number=data.class_number, section=data.section)
+    db.add(student)
+    db.commit()
+    db.refresh(student)
+    return student_view(student)
+
+@app.get("/admin/students")
+def search_students(class_number: Optional[int] = None, q: Optional[str] = None,
+                    db: Session = Depends(get_db),
+                    admin: User = Depends(require_role("admin"))):
+    if class_number is not None and not 1 <= class_number <= 10:
+        raise HTTPException(status_code=422, detail="class_number must be between 1 and 10")
+    stmt = select(Student).join(User)
+    if class_number is not None:
+        stmt = stmt.where(Student.class_number == class_number)
+    if q:
+        stmt = stmt.where(or_(Student.full_name.ilike(f"%{q}%"), User.login_id.ilike(f"%{q}%")))
+    return [student_view(s) for s in db.scalars(stmt.order_by(Student.class_number, Student.full_name)).all()]
+
+@app.put("/admin/students/{student_id}")
+def edit_student(student_id: int, data: StudentUpdate, db: Session = Depends(get_db),
+                 admin: User = Depends(require_role("admin"))):
+    student = db.get(Student, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    changes = data.model_dump(exclude_unset=True)
+    password = changes.pop("password", None)
+    for key, value in changes.items():
+        setattr(student, key, value)
+    if password:
+        student.user.password_hash = hash_password(password)
+    db.commit()
+    db.refresh(student)
+    return student_view(student)
+
+@app.delete("/admin/students/{student_id}", status_code=204)
+def delete_student(student_id: int, db: Session = Depends(get_db),
+                   admin: User = Depends(require_role("admin"))):
+    student = db.get(Student, student_id)
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    user = student.user
+    db.delete(student)
+    db.delete(user)
+    db.commit()
+    return None
+
+@app.post("/admin/teachers", status_code=201)
+def add_teacher(data: TeacherCreate, db: Session = Depends(get_db),
+                admin: User = Depends(require_role("admin"))):
+    ensure_unique_login(db, data.login_id)
+    user = User(login_id=data.login_id, password_hash=hash_password(data.password), role="teacher")
+    db.add(user)
+    db.flush()
+    teacher = Teacher(user_id=user.id, full_name=data.full_name, subject=data.subject)
+    db.add(teacher)
+    db.commit()
+    db.refresh(teacher)
+    return teacher_view(teacher)
+
+@app.get("/admin/teachers")
+def search_teachers(q: Optional[str] = None, db: Session = Depends(get_db),
+                    admin: User = Depends(require_role("admin"))):
+    stmt = select(Teacher).join(User)
+    if q:
+        stmt = stmt.where(or_(Teacher.full_name.ilike(f"%{q}%"), User.login_id.ilike(f"%{q}%"),
+                              Teacher.subject.ilike(f"%{q}%")))
+    return [teacher_view(t) for t in db.scalars(stmt.order_by(Teacher.full_name)).all()]
+
+@app.put("/admin/teachers/{teacher_id}")
+def edit_teacher(teacher_id: int, data: TeacherUpdate, db: Session = Depends(get_db),
+                 admin: User = Depends(require_role("admin"))):
+    teacher = db.get(Teacher, teacher_id)
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    changes = data.model_dump(exclude_unset=True)
+    password = changes.pop("password", None)
+    for key, value in changes.items():
+        setattr(teacher, key, value)
+    if password:
+        teacher.user.password_hash = hash_password(password)
+    db.commit()
+    db.refresh(teacher)
+    return teacher_view(teacher)
+
+@app.delete("/admin/teachers/{teacher_id}", status_code=204)
+def delete_teacher(teacher_id: int, db: Session = Depends(get_db),
+                   admin: User = Depends(require_role("admin"))):
+    teacher = db.get(Teacher, teacher_id)
+    if not teacher:
+        raise HTTPException(status_code=404, detail="Teacher not found")
+    user = teacher.user
+    db.delete(teacher)
+    db.delete(user)
+    db.commit()
+    return None
+
+def student_view(s: Student):
+    return {"id": s.id, "login_id": s.user.login_id, "full_name": s.full_name,
+            "class_number": s.class_number, "section": s.section}
+
+def teacher_view(t: Teacher):
+    return {"id": t.id, "login_id": t.user.login_id, "full_name": t.full_name,
+            "subject": t.subject}
