@@ -264,8 +264,184 @@ async function deleteStudent(id) {
     }
 }
 
-function showTeachers() {
-    document.getElementById("dashboard-content").innerHTML =
-        "<h2>Teacher Management</h2><p>We'll build this next.</p>";
+
+function displayTeachers(teachers) {
+    const list = document.getElementById("teacherList");
+
+    list.innerHTML = "";
+
+    if (teachers.length === 0) {
+        list.textContent = "No teachers found.";
+        return;
+    }
+
+    teachers.forEach(teacher => {
+        const card = document.createElement("div");
+        card.className = "student-card";
+
+        const details = document.createElement("p");
+
+        details.textContent =
+            `${teacher.full_name} | Subject: ${teacher.subject || "-"} | ` +
+            `Login ID: ${teacher.login_id} | ID: ${teacher.id}`;
+
+        const editButton = document.createElement("button");
+        editButton.textContent = "Edit";
+        editButton.onclick = () => editTeacher(teacher);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.textContent = "Delete";
+        deleteButton.onclick = () => deleteTeacher(teacher.id);
+
+        card.append(details, editButton, deleteButton);
+        list.appendChild(card);
+    });
 }
 
+async function addTeacher(event) {
+    event.preventDefault();
+
+    const teacher = {
+        login_id: document.getElementById("teacherLogin").value,
+        password: document.getElementById("teacherPassword").value,
+        full_name: document.getElementById("teacherName").value,
+        subject: document.getElementById("teacherSubject").value || null
+    };
+
+    try {
+        await apiRequest("/admin/teachers", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(teacher)
+        });
+
+        alert("Teacher added successfully!");
+
+        event.target.reset();
+
+        loadTeachers();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+async function loadTeachers() {
+    try {
+        const teachers = await apiRequest("/admin/teachers");
+        displayTeachers(teachers);
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+async function searchTeachers() {
+    const query = document.getElementById("searchTeacher").value;
+
+    try {
+        const teachers = await apiRequest(
+            "/admin/teachers?q=" + encodeURIComponent(query)
+        );
+
+        displayTeachers(teachers);
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+async function editTeacher(teacher) {
+    const name = prompt("Enter teacher name:", teacher.full_name);
+
+    if (name === null) return;
+
+    const subject = prompt("Enter subject:", teacher.subject || "");
+
+    if (subject === null) return;
+
+    if (!name.trim()) {
+        alert("Teacher name cannot be empty.");
+        return;
+    }
+
+    try {
+        await apiRequest(`/admin/teachers/${teacher.id}`, {
+            method: "PUT",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                full_name: name.trim(),
+                subject: subject.trim() || null
+            })
+        });
+
+        alert("Teacher updated successfully!");
+
+        loadTeachers();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
+function showTeachers() {
+    const content = document.getElementById("dashboard-content");
+
+    content.innerHTML = `
+        <h2>Teacher Management</h2>
+
+        <h3>Add Teacher</h3>
+
+        <form id="teacherForm">
+            <input id="teacherLogin" placeholder="Login ID" required>
+
+            <input
+                id="teacherPassword"
+                type="password"
+                placeholder="Password (minimum 8 characters)"
+                required
+            >
+
+            <input id="teacherName" placeholder="Full Name" required>
+
+            <input id="teacherSubject" placeholder="Subject">
+
+            <button type="submit">Add Teacher</button>
+        </form>
+
+        <hr>
+
+        <h3>Search Teachers</h3>
+
+        <input id="searchTeacher" placeholder="Search by teacher name">
+
+        <button onclick="searchTeachers()">Search</button>
+        <button onclick="loadTeachers()">Show All</button>
+
+        <div id="teacherList"></div>
+    `;
+
+    document.getElementById("teacherForm")
+        .addEventListener("submit", addTeacher);
+
+    loadTeachers();
+}
+async function deleteTeacher(id) {
+    if (!confirm("Are you sure you want to delete this teacher?")) {
+        return;
+    }
+
+    try {
+        await apiRequest(`/admin/teachers/${id}`, {
+            method: "DELETE"
+        });
+
+        alert("Teacher deleted successfully!");
+
+        loadTeachers();
+
+    } catch (error) {
+        alert(error.message);
+    }
+}
